@@ -30,13 +30,45 @@ private enum SpeechStateEnum : CustomStringConvertible {
     }
 }
 
+private extension Float {
+    func toInt16() -> Int16? {
+        if (self > Float(Int16.min) && self < Float(Int16.max) && !self.isNaN) {
+            return Int16(self)
+        } else {
+            return nil
+        }
+    }
+}
+
 
 private extension AVAudioPCMBuffer {
 
-    func toDate() -> Data {
-        let channels = UnsafeBufferPointer(start: int16ChannelData, count: 1)
-        let ch0Data = Data(bytes: UnsafeMutablePointer<Int16>(channels[0]), count:Int(frameCapacity * format.streamDescription.pointee.mBytesPerFrame))
-        return ch0Data
+    func toData() -> Data {
+        
+        if (int16ChannelData != nil) {
+            let channels = UnsafeBufferPointer(start: int16ChannelData, count: 1)
+            let ch0Data = Data(bytes: channels[0], count:Int(frameCapacity * format.streamDescription.pointee.mBytesPerFrame))
+            return ch0Data
+        }
+        
+        if (floatChannelData != nil) {
+            let channels = UnsafeBufferPointer(start: floatChannelData, count: 1)
+            let length : Int = Int(frameLength)
+            let floatChannelPtr : UnsafeMutablePointer<Float32> = channels[0]
+            let intChannelPtr : UnsafeMutablePointer<Int16> = UnsafeMutablePointer<Int16>.allocate(capacity: length)
+            for index in 0...length {
+                guard let intValue = (floatChannelPtr[index] * 32767).toInt16() else {
+                    intChannelPtr[index] = 0
+                    continue
+                }
+                intChannelPtr[index] = intValue
+            }
+            let ch0Data = Data(bytes: intChannelPtr, count:length)
+            intChannelPtr.deallocate(capacity: length)
+            return ch0Data
+        }
+        return Data()
+        
     }
 
 }
@@ -74,8 +106,8 @@ open class Decoder {
     
     @discardableResult fileprivate func process_raw(_ data: Data) -> CInt {
         //Sphinx expect words of 2 bytes but the NSFileHandle read one byte at time so the lenght of the data for sphinx is the half of the real one.
-        let dataLenght = data.count / 2
-        let numberOfFrames = ps_process_raw(psDecoder, (data as NSData).bytes.bindMemory(to: int16.self, capacity: data.count), dataLenght, SFalse, SFalse)
+        let dataLength = data.count / 2
+        let numberOfFrames = ps_process_raw(psDecoder, (data as NSData).bytes.bindMemory(to: int16.self, capacity: data.count), dataLength, SFalse, SFalse)
         let hasSpeech = in_speech()
         
         switch (speechState) {
@@ -118,7 +150,7 @@ open class Decoder {
         }
     }
     
-    fileprivate func hypotesisForSpeechAtPath (_ filePath: String) -> Hypothesis? {
+    fileprivate func hypothesisForSpeechAtPath (_ filePath: String) -> Hypothesis? {
         
         if let fileHandle = FileHandle(forReadingAtPath: filePath) {
             
@@ -158,7 +190,7 @@ open class Decoder {
         
         DispatchQueue.global().async {
             
-            let hypothesis = self.hypotesisForSpeechAtPath(filePath)
+            let hypothesis = self.hypothesisForSpeechAtPath(filePath)
             
             DispatchQueue.main.async {
                 complete(hypothesis)
@@ -176,34 +208,35 @@ open class Decoder {
         }
 
         engine = AVAudioEngine()
-
+        
         guard let input = engine.inputNode else {
             print("Can't get input node")
             return
         }
-
-        let formatIn = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 44100, channels: 1, interleaved: false)
-        engine.connect(input, to: engine.outputNode, format: formatIn)
-
-        input.installTap(onBus: 0, bufferSize: 4096, format: formatIn, block: { (buffer: AVAudioPCMBuffer!, time: AVAudioTime!) -> Void in
-
-            let audioData = buffer.toDate()
+        
+        let mixer = AVAudioMixerNode();
+        engine.attach(mixer)
+        mixer.volume = 1.0
+        engine.connect(input, to: mixer, format: mixer.outputFormat(forBus: 0))
+        mixer.installTap(onBus: 0, bufferSize: 4096, format: mixer.outputFormat(forBus: 0), block: { (buffer: AVAudioPCMBuffer!, time: AVAudioTime!) -> Void in
+            
+            let audioData = buffer.toData()
             self.process_raw(audioData)
-
+            
             if self.speechState == .utterance {
-
+                
                 self.end_utt()
                 let hypothesis = self.get_hyp()
-
-                DispatchQueue.main.async(execute: { 
+                
+                DispatchQueue.main.async(execute: {
                     utteranceComplete(hypothesis)
                 })
-
+                
                 self.start_utt()
             }
         })
 
-        engine.mainMixerNode.outputVolume = 0.0
+        
         engine.prepare()
 
         start_utt()
@@ -218,7 +251,6 @@ open class Decoder {
 
     open func stopDecodingSpeech () {
         engine.stop()
-        engine.mainMixerNode.removeTap(onBus: 0)
         engine.reset()
         engine = nil
     }
